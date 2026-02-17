@@ -20,7 +20,13 @@ async def enhance(task: str, project_id: str = None) -> str:
     result = ""
     try:
         print("[MCP] Connecting to backend...")
-        async with httpx.AsyncClient(timeout=30.0) as client:
+       timeout = httpx.Timeout(
+        connect=10.0,    # time to establish connection
+        read=300.0,      # time to wait for data between chunks (5 min)
+        write=10.0,      # time to send request
+        pool=10.0        # time to acquire connection from pool
+     )
+    async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream(
                 "POST",
                 f"{api_url}/api/orchestration/query-internal",
