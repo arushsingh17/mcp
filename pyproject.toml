@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brd-enhancer-mcp"
+version = "0.1.0"
+description = "MCP server that enhances dev tasks with context from project documentation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+brd-enhancer-mcp = "brd_enhancer_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brd_enhancer_mcp"]
