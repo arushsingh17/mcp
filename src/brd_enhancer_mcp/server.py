@@ -3,7 +3,7 @@ import httpx
 import json
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("brd-enhancer")
+mcp = FastMCP("enhance-prompt")
 
 
 async def enhance(task: str, project_id: str = None) -> str:
