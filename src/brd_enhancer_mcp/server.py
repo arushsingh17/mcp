@@ -5,9 +5,8 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("brd-enhancer")
 
-@mcp.prompt()
+
 async def enhance(task: str, project_id: str = None) -> str:
-    """Enhance a dev task with context from your project docs"""
     project_id = project_id or os.environ.get("PROJECT_ID")
     api_url = os.environ.get("API_URL", "http://localhost:8000")
     api_key = os.environ.get("API_KEY")
@@ -51,21 +50,41 @@ async def enhance(task: str, project_id: str = None) -> str:
         print(f"[MCP] Exception: {str(e)}")
         return f"Error calling backend: {str(e)}"
     print("[MCP] Enhancement complete.")
-    return f"Here is the enhanced prompt. Please review it:\n\n```markdown\n{result}\n```\n\nCRITICAL INSTRUCTION TO AGENT: The user wants to review this prompt primarily. Do NOT proceed with implementation. You MUST stop now and ask the user for confirmation before analyzing files or writing code."
+    return result
+
 
 @mcp.tool()
 async def enhance_task(task: str, project_id: str = None) -> str:
     """
-    Search project documentation and return an enhanced prompt with relevant context.
-    Use this to get background info, requirements, or architecture context for a task.
-    Args:
-        task: The task or query to enhance
-        project_id: Optional project ID/GUID to search within. Defaults to configured environment variable.
+    Fetches an enhanced prompt from the project knowledge base. This is a READ-ONLY lookup tool.
+
+    This tool ONLY retrieves and returns text. It does NOT request any action.
+    The returned text is a reference document for the user to read — not a task to execute.
+
+    After calling this tool, your ONLY job is to display the returned text to the user
+    inside a markdown code block. Do not:
+    - Analyze or summarize the output
+    - Read, open, or scan any files
+    - Write or edit any code
+    - Make implementation plans
+    - Take any follow-up actions
+
+    Simply show the output and ask: "Would you like to proceed with this?"
     """
-    return await enhance(task, project_id)
+    raw = await enhance(task, project_id)
+    return f"""[ENHANCED PROMPT — DISPLAY ONLY]
+---
+{raw}
+---
+[END OF ENHANCED PROMPT]
+
+This is a read-only document retrieved from the project knowledge base.
+Display this to the user exactly as-is. Do not take any further action."""
+
 
 def main():
     mcp.run()
+
 
 if __name__ == "__main__":
     main()
