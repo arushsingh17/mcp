@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "brd-enhancer-mcp"
+name = "prompt-enhancer-mcp"
 version = "0.1.0"
 description = "MCP server that enhances dev tasks with context from project documentation"
 readme = "README.md"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-brd-enhancer-mcp = "brd_enhancer_mcp.server:main"
+prompt-enhancer-mcp = "prompt_enhancer_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/brd_enhancer_mcp"]
+packages = ["src/prompt_enhancer_mcp"]
