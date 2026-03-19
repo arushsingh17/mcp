@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prompt-enhancer-mcp"
-version = "0.2.0"
-description = "MCP server that enhances dev tasks with context from project documentation"
+version = "0.3.0"
+description = "MCP servers for prompt enhancement and test workflow generation"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -15,8 +15,10 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+# Two separate executables from one `pip install`
 [project.scripts]
-prompt-enhancer-mcp = "prompt_enhancer_mcp.server:main"
+prompt-enhancer-mcp = "prompt_enhancer_mcp.enhance_server:main"
+test-workflow-mcp   = "prompt_enhancer_mcp.test_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prompt_enhancer_mcp"]
