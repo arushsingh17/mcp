@@ -1,4 +1,3 @@
-import json
 import logging
 import httpx
 from contextlib import asynccontextmanager
@@ -13,7 +12,7 @@ logger = logging.getLogger("mcp.enhance-prompt")
 @asynccontextmanager
 async def lifespan(app):
     """Create a shared httpx client that lives for the entire server lifetime."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         logger.info("Enhance server: HTTP client created")
         yield {"client": client}
     logger.info("Enhance server: HTTP client closed")
@@ -22,36 +21,25 @@ async def lifespan(app):
 mcp = FastMCP("enhance-prompt", lifespan=lifespan)
 
 
-# ─── Streaming helper ─────────────────────────────────────────────────────────
+# ─── Backend call helper ─────────────────────────────────────────────────────
 
-async def _stream_enhance(client: httpx.AsyncClient, api_url: str, api_key: str,
-                          project_id: str, task: str) -> str:
-    """Shared streaming logic for both the prompt and tool."""
-    result = ""
-    async with client.stream(
-        "POST",
+async def _call_enhance(client: httpx.AsyncClient, api_url: str, api_key: str,
+                        project_id: str, task: str) -> str:
+    """Call the backend query-internal endpoint and return the enhanced prompt."""
+    resp = await client.post(
         f"{api_url}/api/orchestration/query-internal",
         headers={"X-API-Key": api_key},
-        json={"project_id": project_id, "query": task, "max_chunks": 5, "return_prompt": True}
-    ) as r:
-        if r.status_code != 200:
-            logger.error("Backend returned %d", r.status_code)
-            return f"Error: Backend returned {r.status_code}"
+        json={"project_id": project_id, "query": task, "max_chunks": 5, "return_prompt": True},
+        timeout=60.0,
+    )
 
-        async for line in r.aiter_lines():
-            if line.startswith("data: "):
-                try:
-                    data = json.loads(line[6:])
-                    if data.get("type") == "enhanced_prompt":
-                        result = data.get("content", "")
-                        logger.info("Received enhanced prompt (%d chars)", len(result))
-                    elif data.get("type") == "chunk":
-                        result += data.get("content", "")
-                    elif data.get("type") == "error":
-                        result += f"\n[Remote Error: {data.get('message')}]"
-                        logger.error("Remote error: %s", data.get('message'))
-                except json.JSONDecodeError:
-                    continue
+    if resp.status_code != 200:
+        logger.error("Backend returned %d — %s", resp.status_code, resp.text)
+        return f"Error: Backend returned {resp.status_code} — {resp.text}"
+
+    data = resp.json()
+    result = data.get("content", "")
+    logger.info("Received enhanced prompt (%d chars)", len(result))
     return result
 
 
@@ -68,16 +56,33 @@ async def enhance(task: str, project_id: str = None) -> str:
     logger.info("Enhancing task: %s (Project: %s)", task, project_id)
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            result = await _stream_enhance(client, api_url, api_key, project_id, task)
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            result = await _call_enhance(client, api_url, api_key, project_id, task)
     except Exception as e:
         logger.exception("Exception during enhance")
-        return f"Error calling backend: {str(e)}"
+        return f"Error calling backend: {type(e).__name__}: {str(e)}"
 
     logger.info("Enhancement complete.")
     return (
-        f"<enhanced_prompt>\n{result}\n</enhanced_prompt>\n\n"
-        "Display this enhanced prompt to the user, then wait for their next instruction."
+        f"TASK: {task}\n\n"
+        f"===================================================================\n"
+        f"MANDATORY: You MUST output the ENTIRE prompt below to the user\n"
+        f"in a single fenced code block (```). Do NOT summarize, paraphrase,\n"
+        f"extract into tables, or abbreviate ANY part of it. The user needs\n"
+        f"to review the full prompt exactly as written.\n"
+        f"===================================================================\n\n"
+        f"```\n"
+        f"{result}\n"
+        f"```\n\n"
+        f"===================================================================\n"
+        f"AFTER displaying the prompt above, follow these rules:\n"
+        f"===================================================================\n"
+        f"1. ASK the user if they want to proceed with using this enhanced\n"
+        f"   prompt. Do NOT start working on the task yet.\n"
+        f"2. ONLY if the user confirms (e.g. 'proceed', 'yes', 'go ahead'),\n"
+        f"   use the enhanced prompt above to carry out the task.\n"
+        f"   Follow ALL instructions in the prompt.\n"
+        f"3. Wait for the user's next instruction."
     )
 
 
@@ -106,15 +111,32 @@ async def enhance_task(task: str, ctx: Context, project_id: str = None) -> str:
 
     try:
         client = get_client(ctx)
-        result = await _stream_enhance(client, api_url, api_key, project_id, task)
+        result = await _call_enhance(client, api_url, api_key, project_id, task)
     except Exception as e:
         logger.exception("Exception during enhance_task")
-        return f"Error calling backend: {str(e)}"
+        return f"Error calling backend: {type(e).__name__}: {str(e)}"
 
     logger.info("Enhancement complete.")
     return (
-        f"<enhanced_prompt>\n{result}\n</enhanced_prompt>\n\n"
-        "Display this enhanced prompt to the user, then wait for their next instruction."
+        f"TASK: {task}\n\n"
+        f"===================================================================\n"
+        f"MANDATORY: You MUST output the ENTIRE prompt below to the user\n"
+        f"in a single fenced code block (```). Do NOT summarize, paraphrase,\n"
+        f"extract into tables, or abbreviate ANY part of it. The user needs\n"
+        f"to review the full prompt exactly as written.\n"
+        f"===================================================================\n\n"
+        f"```\n"
+        f"{result}\n"
+        f"```\n\n"
+        f"===================================================================\n"
+        f"AFTER displaying the prompt above, follow these rules:\n"
+        f"===================================================================\n"
+        f"1. ASK the user if they want to proceed with using this enhanced\n"
+        f"   prompt. Do NOT start working on the task yet.\n"
+        f"2. ONLY if the user confirms (e.g. 'proceed', 'yes', 'go ahead'),\n"
+        f"   use the enhanced prompt above to carry out the task.\n"
+        f"   Follow ALL instructions in the prompt.\n"
+        f"3. Wait for the user's next instruction."
     )
 
 
