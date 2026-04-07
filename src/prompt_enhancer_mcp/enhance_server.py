@@ -2,7 +2,7 @@ import logging
 import httpx
 from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP, Context
-from .config import get_config, validate_config, get_client
+from .config import get_config, validate_config, get_client, get_tech_stack
 
 logger = logging.getLogger("mcp.enhance-prompt")
 
@@ -24,12 +24,20 @@ mcp = FastMCP("enhance-prompt", lifespan=lifespan)
 # ─── Backend call helper ─────────────────────────────────────────────────────
 
 async def _call_enhance(client: httpx.AsyncClient, api_url: str, api_key: str,
-                        project_id: str, task: str) -> str:
+                        project_id: str, task: str,
+                        frontend_requirements: str = "", backend_requirements: str = "") -> str:
     """Call the backend query-internal endpoint and return the enhanced prompt."""
     resp = await client.post(
         f"{api_url}/api/orchestration/query-internal",
         headers={"X-API-Key": api_key},
-        json={"project_id": project_id, "query": task, "max_chunks": 5, "return_prompt": True},
+        json={
+            "project_id": project_id,
+            "query": task,
+            "max_chunks": 5,
+            "return_prompt": True,
+            "frontend_requirements": frontend_requirements,
+            "backend_requirements": backend_requirements,
+        },
         timeout=60.0,
     )
 
@@ -53,11 +61,13 @@ async def enhance(task: str, project_id: str = None) -> str:
     if err := validate_config(project_id, api_key):
         return err
 
+    frontend_requirements, backend_requirements = get_tech_stack()
     logger.info("Enhancing task: %s (Project: %s)", task, project_id)
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            result = await _call_enhance(client, api_url, api_key, project_id, task)
+            result = await _call_enhance(client, api_url, api_key, project_id, task,
+                                         frontend_requirements, backend_requirements)
     except Exception as e:
         logger.exception("Exception during enhance")
         return f"Error calling backend: {type(e).__name__}: {str(e)}"
@@ -107,11 +117,13 @@ async def enhance_task(task: str, ctx: Context, project_id: str = None) -> str:
     if err := validate_config(project_id, api_key):
         return err
 
+    frontend_requirements, backend_requirements = get_tech_stack()
     logger.info("Enhancing task: %s (Project: %s)", task, project_id)
 
     try:
         client = get_client(ctx)
-        result = await _call_enhance(client, api_url, api_key, project_id, task)
+        result = await _call_enhance(client, api_url, api_key, project_id, task,
+                                     frontend_requirements, backend_requirements)
     except Exception as e:
         logger.exception("Exception during enhance_task")
         return f"Error calling backend: {type(e).__name__}: {str(e)}"
