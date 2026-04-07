@@ -21,6 +21,13 @@ def validate_config(project_id: str, api_key: str) -> str | None:
     return None
 
 
+def get_tech_stack() -> tuple[str, str]:
+    """Return (frontend_requirements, backend_requirements) from env."""
+    frontend = os.environ.get("FRONTEND_REQUIREMENTS", "")
+    backend = os.environ.get("BACKEND_REQUIREMENTS", "")
+    return frontend, backend
+
+
 def get_client(ctx: Context) -> httpx.AsyncClient:
     """Get the shared httpx client from lifespan context."""
     return ctx.request_context.lifespan_context["client"]
