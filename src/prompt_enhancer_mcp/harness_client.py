@@ -1,4 +1,9 @@
+import io
+import json
 import logging
+import re
+import zipfile
+
 import httpx
 
 logger = logging.getLogger("mcp.harness-client")
@@ -67,7 +72,7 @@ async def get_execution_details(
 ) -> dict | str:
     """GET /pipeline/api/pipelines/execution/v2/{planExecutionId}"""
     url = f"{cfg['base_url']}/pipeline/api/pipelines/execution/v2/{plan_execution_id}"
-    params = _common_query(cfg)
+    params = {**_common_query(cfg), "renderFullBottomGraph": "true"}
     try:
         resp = await client.get(url, headers=_headers(cfg), params=params, timeout=30.0)
     except httpx.ConnectError:
@@ -107,6 +112,172 @@ def parse_failed_steps(execution_details: dict) -> list[dict]:
     return failed
 
 
+_YAML_KEYS = (
+    "resolvedTemplatesPipelineYaml",
+    "executedPipelineYaml",
+    "pipelineYaml",
+    "yaml",
+    "yamlPipeline",
+)
+
+
+def extract_resolved_yaml(execution_details: dict) -> str | None:
+    """Pull the post-template-expansion YAML from a /execution/v2 response.
+
+    Harness nests these fields inside `pipelineExecutionSummary` in current
+    API versions, but older variants put them at the top of `data`. Check
+    the summary first, then fall back to the top level.
+    """
+    if not isinstance(execution_details, dict):
+        return None
+    summary = execution_details.get("pipelineExecutionSummary") or {}
+    for key in _YAML_KEYS:
+        val = summary.get(key) if isinstance(summary, dict) else None
+        if not (isinstance(val, str) and val.strip()):
+            val = execution_details.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    summary_keys = list(summary.keys()) if isinstance(summary, dict) else []
+    logger.warning(
+        "extract_resolved_yaml: no YAML under any of %s. summary keys=%s  top keys=%s",
+        _YAML_KEYS, summary_keys, list(execution_details.keys()),
+    )
+    return None
+
+
+def extract_pipeline_definition_yaml(definition: dict) -> str | None:
+    """Pull raw YAML from a /pipelines/{id} response body."""
+    if not isinstance(definition, dict):
+        return None
+    for key in _YAML_KEYS:
+        val = definition.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    logger.warning(
+        "extract_pipeline_definition_yaml: no YAML under any of %s. keys=%s",
+        _YAML_KEYS, list(definition.keys()),
+    )
+    return None
+
+
+_EXPR_RE = re.compile(r"<\+[^>]+>")
+
+
+def extract_resolved_step_details(node: dict) -> dict:
+    """Pull the executed step parameters from a nodeMap entry.
+
+    Harness evaluates `<+...>` expressions and applies template inputs before
+    executing a step, then persists the result under `stepParameters`. So when
+    the committed YAML says `command: npm run <+stage.variables.script>`, this
+    returns the actual string that ran (e.g. `npm run build`). That string is
+    the ground truth for reconstructing what executed — the YAML alone can't
+    show it, because runtime inputs and template overrides happen after the
+    YAML is authored.
+
+    Returns a dict with any of: command, script, image, shell, connectorRef,
+    templateRef, expressions_unresolved (bool — true if any `<+...>` remains
+    inside the resolved strings, which means Harness couldn't fully resolve).
+    """
+    if not isinstance(node, dict):
+        return {}
+    params = node.get("stepParameters")
+    if not isinstance(params, dict):
+        return {}
+
+    spec = params.get("spec") if isinstance(params.get("spec"), dict) else params
+
+    resolved: dict = {}
+    for key in ("command", "script", "image", "shell", "connectorRef"):
+        val = spec.get(key) if isinstance(spec, dict) else None
+        if isinstance(val, str) and val.strip():
+            resolved[key] = val
+
+    tlc = params.get("templateLinkConfig")
+    if isinstance(tlc, dict):
+        ref = tlc.get("templateRef")
+        if isinstance(ref, str) and ref.strip():
+            resolved["templateRef"] = ref
+
+    has_unresolved = any(
+        isinstance(v, str) and _EXPR_RE.search(v)
+        for v in resolved.values()
+    )
+    if resolved:
+        resolved["expressions_unresolved"] = has_unresolved
+    return resolved
+
+
+async def get_execution_resolved_yaml(
+    client: httpx.AsyncClient,
+    cfg: dict,
+    plan_execution_id: str,
+) -> str | None:
+    """GET /pipeline/api/pipelines/execution/{planExecutionId}/metadata
+
+    Returns `executionYaml` — Harness's template-expanded pipeline YAML for this
+    execution. Templates (e.g. `templateRef: account.SonarQube_Step`) are
+    inlined into their full step bodies, so this is a material upgrade over the
+    committed source. Note: `<+...>` variable/secret expressions are NOT
+    substituted here — those remain under each step's `stepParameters`. Returns
+    None on any failure, since callers already have the committed-YAML fallback.
+    """
+    url = (
+        f"{cfg['base_url']}/pipeline/api/pipelines/execution/"
+        f"{plan_execution_id}/metadata"
+    )
+    try:
+        resp = await client.get(url, headers=_headers(cfg), params=_common_query(cfg), timeout=30.0)
+    except httpx.HTTPError as e:
+        logger.info("get_execution_resolved_yaml failed (non-fatal): %s", e)
+        return None
+    if resp.status_code != 200:
+        logger.info(
+            "get_execution_resolved_yaml: %d for %s (non-fatal)",
+            resp.status_code, plan_execution_id,
+        )
+        return None
+    data = resp.json().get("data") or {}
+    val = data.get("executionYaml")
+    return val if isinstance(val, str) and val.strip() else None
+
+
+async def get_execution_input_set(
+    client: httpx.AsyncClient,
+    cfg: dict,
+    plan_execution_id: str,
+) -> str | None:
+    """GET /pipeline/api/pipelines/execution/{planExecutionId}/inputset
+
+    Returns the runtime input YAML supplied for this execution — what values
+    were bound to `<+input>` placeholders and which template inputs the
+    trigger overrode. Complements the pipeline definition YAML by showing the
+    runtime side of the contract. Best-effort: returns None on any failure,
+    since this is supplementary context rather than a hard dependency.
+    """
+    url = (
+        f"{cfg['base_url']}/pipeline/api/pipelines/execution/"
+        f"{plan_execution_id}/inputset"
+    )
+    params = {**_common_query(cfg), "resolveExpressions": "true"}
+    try:
+        resp = await client.get(url, headers=_headers(cfg), params=params, timeout=30.0)
+    except httpx.HTTPError as e:
+        logger.info("get_execution_input_set failed (non-fatal): %s", e)
+        return None
+    if resp.status_code != 200:
+        logger.info(
+            "get_execution_input_set: %d for %s (non-fatal)",
+            resp.status_code, plan_execution_id,
+        )
+        return None
+    data = resp.json().get("data") or {}
+    for key in ("inputSetYaml", "inputSetTemplateYaml", "yaml", "pipelineYaml"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return None
+
+
 async def download_step_logs(
     client: httpx.AsyncClient,
     cfg: dict,
@@ -123,6 +294,7 @@ async def download_step_logs(
         f"-{plan_execution_id}/{stage_id}/{step_id}"
     )
     params = {"accountID": cfg["account_id"], "prefix": prefix}
+    logger.info("download_step_logs: POST %s  prefix=%s", url, prefix)
     try:
         resp = await client.post(url, headers=_headers(cfg), params=params, timeout=30.0)
     except httpx.ConnectError:
@@ -131,25 +303,69 @@ async def download_step_logs(
         return f"Harness log request failed: {type(e).__name__}: {e}"
 
     if resp.status_code != 200:
+        logger.warning(
+            "download_step_logs: log-service POST returned %d for prefix=%s body=%s",
+            resp.status_code, prefix, resp.text[:300],
+        )
         return _map_error(resp, f"logs for step {step_id}")
 
     download_link = resp.json().get("link", "")
     if not download_link:
+        logger.warning("download_step_logs: no download link returned for prefix=%s", prefix)
         return "(no log download link returned)"
 
+    logger.info("download_step_logs: following link=%s", download_link[:300])
     try:
         log_resp = await client.get(download_link, timeout=30.0)
     except httpx.HTTPError as e:
         return f"Failed to fetch log blob: {type(e).__name__}: {e}"
 
     if log_resp.status_code != 200:
+        logger.warning(
+            "download_step_logs: blob GET returned %d  prefix=%s  link=%s  body=%s",
+            log_resp.status_code, prefix, download_link[:300], log_resp.text[:300],
+        )
         return f"Log blob fetch returned {log_resp.status_code}"
 
-    text = log_resp.text
+    text = _decode_harness_log_blob(log_resp.content)
     if len(text) > 50_000:
         lines = text.splitlines()
         text = "\n".join(lines[-200:])
     return text
+
+
+def _decode_harness_log_blob(body: bytes) -> str:
+    """Harness log-service returns a ZIP of JSON-lines files ({"out": "..."} per line).
+
+    Unzip, pull the first entry, and extract the `out` field from each JSON line.
+    """
+    if body[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as zf:
+                names = zf.namelist()
+                if not names:
+                    return "(empty log archive)"
+                raw = zf.read(names[0]).decode("utf-8", errors="replace")
+        except zipfile.BadZipFile as e:
+            return f"(failed to unzip log blob: {e})"
+    else:
+        raw = body.decode("utf-8", errors="replace")
+
+    out_lines: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            out_lines.append(line)
+            continue
+        if isinstance(obj, dict):
+            out_lines.append(str(obj.get("out", "")).rstrip("\n"))
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
 
 
 async def get_pipeline_definition(

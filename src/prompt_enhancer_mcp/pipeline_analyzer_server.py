@@ -53,12 +53,28 @@ def _find_stage_for_step(execution_details: dict, step_node_id: str) -> str | No
     adjacency = graph.get("nodeAdjacencyListMap") or {}
     node_map = graph.get("nodeMap") or {}
 
+    # Build parent_of mapping.  Children are explicitly nested; nodes
+    # linked via nextIds from a child are siblings at the same nesting
+    # level and therefore share the same parent.
     parent_of: dict[str, str] = {}
     for parent_id, adj in adjacency.items():
         if not isinstance(adj, dict):
             continue
         for child in (adj.get("children") or []):
             parent_of[child] = parent_id
+            # Walk the nextIds chain — siblings belong to the same parent.
+            queue = [child]
+            visited = {child}
+            while queue:
+                cur = queue.pop(0)
+                next_adj = adjacency.get(cur)
+                if not isinstance(next_adj, dict):
+                    continue
+                for nid in (next_adj.get("nextIds") or []):
+                    if nid and nid not in visited:
+                        parent_of[nid] = parent_id
+                        visited.add(nid)
+                        queue.append(nid)
 
     current = step_node_id
     for _ in range(20):
@@ -76,15 +92,21 @@ async def _call_rag(
     client: httpx.AsyncClient,
     api_url: str,
     api_key: str,
+    project_id: str,
     query: str,
     limit: int = 5,
 ) -> dict | str:
-    """POST {API_URL}/api/rag/search — returns parsed JSON or error string."""
+    """POST {API_URL}/api/orchestration/query-internal — returns parsed JSON or error string."""
     try:
         resp = await client.post(
-            f"{api_url}/api/rag/search",
+            f"{api_url}/api/orchestration/query-internal",
             headers={"X-API-Key": api_key},
-            json={"query": query, "limit": limit},
+            json={
+                "project_id": project_id,
+                "query": query,
+                "max_chunks": limit,
+                "return_prompt": True,
+            },
             timeout=60.0,
         )
     except httpx.HTTPError as e:
@@ -167,9 +189,9 @@ async def _build_analysis(
     if err := validate_harness_config(harness_cfg):
         return err
 
-    _, api_url, api_key = get_config()
-    if include_rag and (err := validate_config("placeholder", api_key)):
-        return "Error: API_KEY must be set for RAG search (include_rag=False to skip)."
+    project_id, api_url, api_key = get_config()
+    if include_rag and (err := validate_config(project_id, api_key)):
+        return "Error: PROJECT_ID and API_KEY must be set for RAG search (include_rag=False to skip)."
 
     details = await hc.get_execution_details(client, harness_cfg, exec_id)
     if isinstance(details, str):
@@ -184,6 +206,38 @@ async def _build_analysis(
     start_ts = summary.get("startTs", "?")
     end_ts = summary.get("endTs", "?")
 
+    # YAML precedence: (1) inline YAML on /execution/v2 response, (2) the
+    # /execution/{id}/metadata endpoint's executionYaml (templates inlined,
+    # <+...> expressions still literal), (3) committed pipeline definition.
+    resolved_yaml = hc.extract_resolved_yaml(details)
+    yaml_source: str | None = (
+        "execution response (resolved, post-template-expansion)" if resolved_yaml else None
+    )
+    yaml_error: str | None = None
+
+    if not resolved_yaml:
+        metadata_yaml = await hc.get_execution_resolved_yaml(client, harness_cfg, exec_id)
+        if metadata_yaml:
+            resolved_yaml = metadata_yaml
+            yaml_source = (
+                "execution metadata (templates inlined; `<+...>` expressions "
+                "remain literal — see per-step **Executed Step Parameters** for substituted values)"
+            )
+
+    if not resolved_yaml:
+        if not pipeline_id:
+            yaml_error = "execution response had no YAML field and pipelineIdentifier is missing"
+        else:
+            definition = await hc.get_pipeline_definition(client, harness_cfg, pipeline_id)
+            if isinstance(definition, str):
+                yaml_error = f"pipeline definition fetch failed — {definition}"
+            else:
+                resolved_yaml = hc.extract_pipeline_definition_yaml(definition)
+                if resolved_yaml:
+                    yaml_source = "pipeline definition (raw source, not template-expanded)"
+                else:
+                    yaml_error = "no YAML field in pipeline definition response"
+
     failed_steps = hc.parse_failed_steps(details)
 
     if not failed_steps:
@@ -192,11 +246,20 @@ async def _build_analysis(
             f"Execution status: {status}. No failed step nodes found in the execution graph."
         )
 
+    # Step types that are structural containers — they never produce logs.
+    skip_log_types = {
+        "PIPELINE_SECTION", "STAGES_STEP", "NG_EXECUTION",
+        "NG_SECTION", "NG_FORK", "STEP_GROUP",
+        "IntegrationStageStepPMS", "DEPLOYMENT_STAGE_STEP",
+    }
+
     # Build concurrent tasks: log fetches + single RAG call.
     log_tasks = []
     log_targets = []
     if include_logs and pipeline_id and run_sequence:
         for step in failed_steps:
+            if step.get("step_type", "") in skip_log_types:
+                continue
             stage_id = _find_stage_for_step(details, step["node_id"])
             step_identifier = step.get("identifier") or step["node_id"]
             if stage_id:
@@ -207,6 +270,11 @@ async def _build_analysis(
                     )
                 )
                 log_targets.append(step)
+            else:
+                logger.warning(
+                    "Could not resolve stage for step %s (node %s) — skipping log fetch",
+                    step.get("name"), step["node_id"],
+                )
 
     rag_task = None
     if include_rag:
@@ -214,16 +282,23 @@ async def _build_analysis(
             f"{s.get('step_type', '')}: {s.get('failure_message', '')}".strip(": ")
             for s in failed_steps if s.get("failure_message")
         )[:1000] or pipeline_name
-        rag_task = _call_rag(client, api_url, api_key, rag_query, limit=5)
+        rag_task = _call_rag(client, api_url, api_key, project_id, rag_query, limit=5)
+
+    input_set_task = hc.get_execution_input_set(client, harness_cfg, exec_id)
 
     gathered = await asyncio.gather(
         *log_tasks,
         rag_task if rag_task is not None else asyncio.sleep(0, result=None),
+        input_set_task,
         return_exceptions=True,
     )
 
     log_results = gathered[: len(log_tasks)]
-    rag_result = gathered[-1] if rag_task is not None else None
+    rag_result = gathered[len(log_tasks)] if rag_task is not None else None
+    input_set_result = gathered[-1]
+    input_set_yaml: str | None = (
+        input_set_result if isinstance(input_set_result, str) and input_set_result.strip() else None
+    )
 
     # Apply 500-line aggregate cap across all logs.
     capped_logs: dict[str, str] = {}
@@ -239,9 +314,38 @@ async def _build_analysis(
         remaining -= len(take)
         capped_logs[step["node_id"]] = "\n".join(take)
 
+    capped_yaml: str | None = None
+    if resolved_yaml:
+        yaml_lines = resolved_yaml.splitlines()
+        if len(yaml_lines) > 500:
+            capped_yaml = "\n".join(yaml_lines[:500]) + f"\n# ... truncated ({len(yaml_lines) - 500} more lines)"
+        else:
+            capped_yaml = resolved_yaml
+
+    node_map = (details.get("executionGraph") or {}).get("nodeMap") or {}
+
     # Build the markdown blob.
     out = [
         "## Pipeline Failure Analysis",
+        "",
+        "### Analysis Framing",
+        "Attribute the root cause of this failure to exactly one of:",
+        "1. **Pipeline / infra misconfiguration** — the YAML stanza, runner image, registry, or platform config is wrong.",
+        "2. **Application code or dependencies** — the repo's source, `package.json`, tests, or build config is wrong.",
+        "3. **Environmental / transient** — network blip, registry outage, flaky upstream, intermittent timeout.",
+        "",
+        "**Evidence hierarchy — use in this order:**",
+        "1. **Executed Command (resolved)** under each failed step — this is the actual string Harness ran, "
+        "after `<+...>` expressions and template inputs were applied. Ground truth.",
+        "2. **Runtime Input Overrides** — shows which runtime inputs and template overrides were supplied "
+        "when the pipeline was triggered. Explains *why* the resolved command differs from the YAML.",
+        "3. **Pipeline YAML** — the authored pipeline (templates may be inlined depending on source; see the "
+        "label under the YAML section). Still contains unresolved `<+...>` expressions, so it does not "
+        "show what actually ran at the variable level.",
+        "4. **Logs** — the runtime output.",
+        "",
+        "If the resolved command differs from the YAML stanza, the divergence comes from runtime inputs or a "
+        "template override — name the specific input/override rather than speculating.",
         "",
         "### Execution Summary",
         f"- Pipeline: {pipeline_name}",
@@ -261,6 +365,24 @@ async def _build_analysis(
             out.append(f"- Failure types: {', '.join(step['failure_types'])}")
         if step.get("start_ts") or step.get("end_ts"):
             out.append(f"- Window: {step.get('start_ts', '?')} → {step.get('end_ts', '?')}")
+
+        resolved = hc.extract_resolved_step_details(node_map.get(step["node_id"]) or {})
+        if resolved:
+            unresolved = resolved.pop("expressions_unresolved", False)
+            label = "Executed Step Parameters (resolved)" if not unresolved else \
+                    "Executed Step Parameters (partially resolved — some `<+...>` expressions remain)"
+            out.append("")
+            out.append(f"##### {label}")
+            for key in ("image", "shell", "connectorRef", "templateRef"):
+                if key in resolved:
+                    out.append(f"- **{key}**: `{resolved[key]}`")
+            for key in ("command", "script"):
+                if key in resolved:
+                    out.append(f"- **{key}**:")
+                    out.append("```sh")
+                    out.append(resolved[key])
+                    out.append("```")
+
         log_text = capped_logs.get(step["node_id"])
         if log_text:
             out.append("")
@@ -269,6 +391,41 @@ async def _build_analysis(
             out.append(log_text)
             out.append("```")
         out.append("")
+
+    out.append("### Runtime Input Overrides")
+    if input_set_yaml:
+        out.append(
+            "_Input-set YAML supplied for this execution — shows what values were bound to "
+            "`<+input>` placeholders and which template inputs were overridden at trigger time._"
+        )
+        out.append("")
+        out.append("```yaml")
+        out.append(input_set_yaml if len(input_set_yaml.splitlines()) <= 300
+                   else "\n".join(input_set_yaml.splitlines()[:300]) +
+                        f"\n# ... truncated ({len(input_set_yaml.splitlines()) - 300} more lines)")
+        out.append("```")
+    else:
+        out.append(
+            "_No input-set YAML available. This usually means the pipeline had no runtime inputs "
+            "or the endpoint was unreachable — check the resolved step parameters above for the "
+            "ground truth of what ran._"
+        )
+    out.append("")
+
+    out.append("### Pipeline YAML")
+    if capped_yaml:
+        out.append(
+            f"_Source: {yaml_source}. For values actually substituted at runtime "
+            "(e.g. `<+stage.variables.X>`, `<+secrets.getValue(...)>`), prefer the "
+            "**Executed Step Parameters** sections above — those are the ground truth._"
+        )
+        out.append("")
+        out.append("```yaml")
+        out.append(capped_yaml)
+        out.append("```")
+    else:
+        out.append(f"_Not available — {yaml_error or 'unknown reason'}._")
+    out.append("")
 
     if include_rag:
         out.append("### Organizational Context (from RAG)")
