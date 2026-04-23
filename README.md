@@ -1,6 +1,12 @@
 # brd-enhancer-mcp
 
-An MCP server that enhances developer tasks with context pulled from your project documentation.
+A package that ships three MCP servers for an AI-assisted SDLC workflow:
+
+| Server | Executable | Purpose |
+|---|---|---|
+| enhance-prompt | `prompt-enhancer-mcp` | Enhance dev tasks with project documentation context |
+| test-workflow | `test-workflow-mcp` | Generate & submit Gherkin test cases from Confluence |
+| pipeline-analyzer | `pipeline-analyzer-mcp` | Analyze Harness pipeline failures with RAG context from past incidents |
 
 ---
 
@@ -132,11 +138,45 @@ Use the full path you got from the command above.
 
 ## Environment Variables
 
+### Shared (all servers)
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `API_KEY` | ✅ Yes | — | Your personal API key |
+| `API_KEY` | ✅ Yes | — | Your personal backend API key |
 | `PROJECT_ID` | ✅ Yes | — | Your project ID/GUID |
 | `API_URL` | ❌ No | `http://localhost:8000` | Backend URL |
+
+### pipeline-analyzer-mcp only
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HARNESS_API_KEY` | ✅ Yes | — | Harness personal access token (`pat.ACCOUNT.TOKEN_ID.SECRET`) |
+| `HARNESS_ACCOUNT_ID` | ✅ Yes | — | Harness account identifier |
+| `HARNESS_PROJECT_ID` | ✅ Yes | — | Harness project identifier |
+| `HARNESS_ORG_ID` | ❌ No | `default` | Harness organization identifier |
+| `HARNESS_BASE_URL` | ❌ No | `https://app.harness.io` | Harness base URL (change for self-hosted) |
+
+### pipeline-analyzer example config
+
+```json
+{
+    "mcpServers": {
+        "pipeline-analyzer": {
+            "command": "pipeline-analyzer-mcp",
+            "env": {
+                "API_URL": "https://your-backend.com",
+                "API_KEY": "your_backend_api_key",
+                "PROJECT_ID": "your_project_id",
+                "HARNESS_API_KEY": "pat.ACCOUNT.TOKEN_ID.SECRET",
+                "HARNESS_ACCOUNT_ID": "your_harness_account_id",
+                "HARNESS_ORG_ID": "default",
+                "HARNESS_PROJECT_ID": "your_harness_project_id",
+                "HARNESS_BASE_URL": "https://app.harness.io"
+            }
+        }
+    }
+}
+```
 
 ---
 
